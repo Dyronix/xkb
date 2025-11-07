@@ -1,5 +1,5 @@
 #include "xkbX11KeyboardBackend.h"
-#include "xkbWindow.h"
+#include "xkbKeyMap.h"
 
 #include <X11/Xutil.h>
 #include <X11/XKBlib.h>

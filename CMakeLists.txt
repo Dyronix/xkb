@@ -9,12 +9,14 @@ add_library(xkb STATIC)
 
 # Sources
 target_sources(xkb PRIVATE
+    ${XKB_SOURCE_DIRECTORY}/xkbKeyMap.cpp
     ${XKB_SOURCE_DIRECTORY}/xkbX11KeyboardBackend.cpp
     ${XKB_SOURCE_DIRECTORY}/xkbEvDevKeyboardBackend.cpp
     ${XKB_SOURCE_DIRECTORY}/xkbInputDetection.cpp
 )
 
 target_sources(xkb PUBLIC
+    ${XKB_INCLUDE_DIRECTORY}/xkbKeyMap.h
     ${XKB_INCLUDE_DIRECTORY}/xkbKeyboardBackend.h
     ${XKB_INCLUDE_DIRECTORY}/xkbX11KeyboardBackend.h
     ${XKB_INCLUDE_DIRECTORY}/xkbInputDetection.h
