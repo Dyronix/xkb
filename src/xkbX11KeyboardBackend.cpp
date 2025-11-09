@@ -6,30 +6,67 @@
 
 #include <iostream>
 
+namespace
+{
+    // Predicate used by XIfEvent / XCheckIfEvent so we only remove keyboard events
+    Bool KeyOnlyPredicate(Display* /*dpy*/, XEvent* ev, XPointer /*arg*/)
+    {
+        return ev->type == KeyPress
+            || ev->type == KeyRelease
+            || ev->type == FocusIn
+            || ev->type == FocusOut
+            || ev->type == KeymapNotify
+            || ev->type == MappingNotify;
+    }
+}
+
 namespace xkb
 {
     X11KeyboardBackend::X11KeyboardBackend(Display* display, Window& window)
-        : m_Display(display)
+        : m_AppDisplay(display)
         , m_Window(window)
     {}
 
     X11KeyboardBackend::~X11KeyboardBackend()
     {
         Stop(); 
+
+        if (m_KeyboardDisplay)
+        {
+            // Only close the display we own
+            XCloseDisplay(m_KeyboardDisplay);
+            m_KeyboardDisplay = nullptr;
+        }
     }
 
     bool X11KeyboardBackend::Init()
     {
-        if (!m_Display || !m_Window)
+        if (!m_AppDisplay || !m_Window)
         {
             return false;
         }
 
-        return SelectMasks();
+        // Open a SECOND connection using the same display string.
+        // Each connection has its own event queue; we won't consume the app's events.
+        const char* name = XDisplayString(m_AppDisplay);
+        m_KeyboardDisplay = XOpenDisplay(name);
+        if (!m_KeyboardDisplay)
+        {
+            return false;
+        }
+
+        // Make key repeat detectable on our connection
+        Bool supported_out = False;
+        XkbSetDetectableAutoRepeat(m_KeyboardDisplay, True, &supported_out);
+
+        m_MasksSelected = SelectMasks();
+
+        return m_MasksSelected;
     }
 
     void X11KeyboardBackend::Start()
     {
+        m_StopThread = false;
         m_Thread = std::thread(&X11KeyboardBackend::Loop, this);
     }
 
@@ -44,45 +81,28 @@ namespace xkb
 
     bool X11KeyboardBackend::SelectMasks()
     {
-        if (!m_Display || !m_Window)
+        if (!m_KeyboardDisplay || !m_Window)
         {
             return false;
         }
 
-        Bool supported_out = False;
-        XkbSetDetectableAutoRepeat(m_Display, True, &supported_out);
+        long mask = KeyPressMask | KeyReleaseMask | FocusChangeMask | KeymapStateMask;
 
-        XWindowAttributes xwin_attrs{};
-
-        if (XGetWindowAttributes(m_Display, m_Window, &xwin_attrs))
-        {
-            XSelectInput(m_Display, m_Window, xwin_attrs.your_event_mask | KeyPressMask | KeyReleaseMask | FocusChangeMask | KeymapStateMask);
-        }
-        else
-        {
-            XSelectInput(m_Display, m_Window, KeyPressMask | KeyReleaseMask | FocusChangeMask | KeymapStateMask);
-        }
-
-        XFlush(m_Display);
+        XSelectInput(m_KeyboardDisplay, m_Window, mask);
+        XFlush(m_KeyboardDisplay);
 
         return true;
     }
 
     void X11KeyboardBackend::SyncFromServer()
     {
-        if (!m_Display)
-        {
-            return;
-        }
-
-        if (!m_SetKey)
+        if (!m_KeyboardDisplay || !m_SetKey)
         {
             return;
         }
 
         char keys_state[32]{};
-
-        if (XQueryKeymap(m_Display, keys_state) == 0)
+        if (XQueryKeymap(m_KeyboardDisplay, keys_state) == 0)
         {
             return;
         }
@@ -91,8 +111,7 @@ namespace xkb
         {
             const bool is_down = (keys_state[key_code >> 3] & (1 << (key_code & 7))) != 0;
 
-            KeySym key_sym = XkbKeycodeToKeysym(m_Display, static_cast<unsigned int>(key_code), 0, 0);
-
+            KeySym key_sym = XkbKeycodeToKeysym(m_KeyboardDisplay, static_cast<unsigned int>(key_code), 0, 0);
             if (key_sym != NoSymbol)
             {
                 if (auto index = XKeySymToIndex(key_sym))
@@ -105,121 +124,93 @@ namespace xkb
 
     void X11KeyboardBackend::Loop()
     {
-        if (!m_Display || !m_Window)
+        if (!m_KeyboardDisplay || !m_Window || !m_SetKey || !m_MasksSelected)
         {
             return;
         }
 
-        if (!m_SetKey)
-        {
-            return;
-        }
-
+        // Initialize timestamps
         m_LastPressTimeStamp.fill(0);
 
+        // Blocking predicate loop:
+        //  - waits for the next keyboard-related event
+        //  - NEVER removes non-keyboard events from any queue
         while (!m_StopThread)
         {
-            XEvent ev;
-            XNextEvent(m_Display, &ev); // block for at least one event
+            XEvent ev{};
+            XIfEvent(m_KeyboardDisplay, &ev, &KeyOnlyPredicate, nullptr);
 
-            for (;;)
+            // Optional IME filter; do not skip dispatch because of it
+            XFilterEvent(&ev, None);
+
+            switch (ev.type)
             {
-                int saved_keycode = 0;
-                if (ev.type == KeyPress || ev.type == KeyRelease)
+            case KeyPress:
+            {
+                const int key_code = ev.xkey.keycode;
+                if (key_code >= 0 && key_code < 256)
                 {
-                    saved_keycode = ev.xkey.keycode;
-                }
+                    const unsigned long ts = ev.xkey.time;
+                    const unsigned long prev = m_LastPressTimeStamp[key_code];
+                    const unsigned long diff = ts - prev; // wrap-safe
 
-                const Bool filtered = XFilterEvent(&ev, None);
-                (void)filtered; // suppress unused warning; filtering helps avoid IME duplicates
-
-                switch (ev.type)
-                {
-                case KeyPress:
-                {
-                    const int key_code = saved_keycode;
-
-                    if (key_code >= 0 && key_code < 256)
+                    // Same duplicate filter that GLFW uses conceptually
+                    if (diff == ts || (diff > 0 && diff < (1ul << 31)))
                     {
-                        const unsigned long time_stamp = ev.xkey.time;
-                        const unsigned long prev_time_stamp = m_LastPressTimeStamp[key_code];
-                        const unsigned long diff = time_stamp - prev_time_stamp; // wrap-safe
-
-                        if (diff == time_stamp || (diff > 0 && diff < (1ul << 31)))
+                        KeySym sym = XkbKeycodeToKeysym(m_KeyboardDisplay, key_code, 0, 0);
+                        if (sym != NoSymbol)
                         {
-                            KeySym key_sym = XkbKeycodeToKeysym(m_Display, key_code, 0, 0);
-                            if (key_sym != NoSymbol)
-                            {       
-                                if (auto index = XKeySymToIndex(key_sym))
-                                {
-                                    m_SetKey(*index, true);
-                                }
-                            }
-                            
-                            m_LastPressTimeStamp[key_code] = time_stamp;
-                        }
-                    }
-                }
-
-                break;
-
-                case KeyRelease:
-                {
-                    const int key_code = saved_keycode;
-
-                    if (key_code >= 0 && key_code < 256)
-                    {
-                        KeySym key_sym = XkbKeycodeToKeysym(m_Display, key_code, 0, 0);
-
-                        if (key_sym != NoSymbol)
-                        {
-                            if (auto index = XKeySymToIndex(key_sym))
+                            if (auto idx = XKeySymToIndex(sym))
                             {
-                                m_SetKey(*index, false);
+                                m_SetKey(*idx, true);
                             }
+                        }
+                        m_LastPressTimeStamp[key_code] = ts;
+                    }
+                }
+            } break;
+
+            case KeyRelease:
+            {
+                const int key_code = ev.xkey.keycode;
+                if (key_code >= 0 && key_code < 256)
+                {
+                    KeySym sym = XkbKeycodeToKeysym(m_KeyboardDisplay, key_code, 0, 0);
+                    if (sym != NoSymbol)
+                    {
+                        if (auto idx = XKeySymToIndex(sym))
+                        {
+                            m_SetKey(*idx, false);
                         }
                     }
                 }
+            } break;
 
+            case FocusOut:
+                // pessimistic clear on focus loss
+                for (size_t i = 0; i < 256; ++i)
+                {
+                    m_SetKey(i, false);
+                }
+                
+                m_LastPressTimeStamp.fill(0);
                 break;
 
-                case FocusOut:
+            case FocusIn:
+            case KeymapNotify:
+                SyncFromServer();
+                break;
 
-                    // lose focus → pessimistically clear via snapshot on regain
-                    for (size_t i = 0; i < 256; ++i)
-                    {
-                        m_SetKey(i, false);
-                    }
+            case MappingNotify:
+                XRefreshKeyboardMapping(&ev.xmapping);
+                break;
 
-                    m_LastPressTimeStamp.fill(0);
-
-                    break;
-
-                case FocusIn:
-                case KeymapNotify:
-
-                    SyncFromServer();
-
-                    break;
-
-                case MappingNotify:
-
-                    XRefreshKeyboardMapping(&ev.xmapping);
-
-                    break;
-
-                default:
-                    break;
-
-                }
-
-                if (XPending(m_Display) == 0)
-                {
-                    break;
-                }
-
-                XNextEvent(m_Display, &ev);
+            default:
+                break;
             }
+
+            // Small yield to avoid burning a core if events flood
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
 } // namespace xkb

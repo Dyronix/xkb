@@ -23,10 +23,13 @@ namespace xkb
         bool SelectMasks();
         void SyncFromServer();
 
-        Display* m_Display = nullptr;
+        Display* m_AppDisplay = nullptr;
+        Display* m_KeyboardDisplay = nullptr;
         Window m_Window = 0;
+
         std::thread m_Thread;
         std::array<unsigned long, 256> m_LastPressTimeStamp{};
         bool m_StopThread{false};
+        bool m_MasksSelected{false};
     };
 } // namespace xkb
